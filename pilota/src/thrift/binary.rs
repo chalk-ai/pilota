@@ -9,6 +9,9 @@ use super::{
     ProtocolException, TAsyncInputProtocol, TFieldIdentifier, TInputProtocol, TLengthProtocol,
     TListIdentifier, TMapIdentifier, TMessageIdentifier, TMessageType, TOutputProtocol,
     TSetIdentifier, TStructIdentifier, TType, ThriftException, ZERO_COPY_THRESHOLD,
+    decode_limits::{
+        BoundedReader, DEFAULT_MAX_COLLECTION_ELEMENTS, DEFAULT_MAX_MESSAGE_BYTES, signed_size,
+    },
     error::ProtocolExceptionKind,
     new_protocol_exception,
     rw_ext::{ReadExt, WriteExt},
@@ -759,15 +762,31 @@ impl TInputProtocol for TBinaryProtocol<&mut Bytes> {
 }
 
 pub struct TAsyncBinaryProtocol<R> {
-    reader: R,
+    reader: BoundedReader<R>,
 }
 
 impl<R> TAsyncBinaryProtocol<R>
 where
     R: AsyncRead + Unpin + Send,
 {
+    /// Decode messages with a 64 MiB byte limit and 1,048,576 collection elements.
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self::with_limits(
+            reader,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_COLLECTION_ELEMENTS,
+        )
+    }
+
+    /// Set per-message wire-byte and aggregate collection-element limits.
+    pub fn with_limits(
+        reader: R,
+        max_message_bytes: usize,
+        max_collection_elements: usize,
+    ) -> Self {
+        Self {
+            reader: BoundedReader::new(reader, max_message_bytes, max_collection_elements),
+        }
     }
 }
 
@@ -777,6 +796,7 @@ where
 {
     // https://github.com/apache/thrift/blob/master/doc/specs/thrift-binary-protocol.md
     async fn read_message_begin(&mut self) -> Result<TMessageIdentifier, ThriftException> {
+        self.reader.reset();
         let size = self.reader.read_i32().await?;
         if size > 0 {
             return Err(new_protocol_exception(
@@ -862,11 +882,8 @@ where
 
     #[inline]
     async fn read_bytes_vec(&mut self) -> Result<Vec<u8>, ThriftException> {
-        let len = self.reader.read_i32().await? as usize;
-        // FIXME: use maybe_uninit?
-        let mut v = vec![0; len];
-        self.reader.read_exact(&mut v).await?;
-        Ok(v)
+        let len = signed_size(self.reader.read_i32().await?)?;
+        self.reader.read_bytes(len).await
     }
 
     #[inline]
@@ -878,11 +895,12 @@ where
 
     #[inline]
     async fn read_string(&mut self) -> Result<String, ThriftException> {
-        let len = self.reader.read_i32().await? as usize;
-        // FIXME: use maybe_uninit?
-        let mut v = vec![0; len];
-        self.reader.read_exact(&mut v).await?;
-        Ok(unsafe { String::from_utf8_unchecked(v) })
+        String::from_utf8(self.read_bytes_vec().await?).map_err(|_| {
+            new_protocol_exception(
+                ProtocolExceptionKind::InvalidData,
+                "invalid UTF-8 in Thrift string",
+            )
+        })
     }
 
     #[inline]
@@ -926,8 +944,9 @@ where
             .read_byte()
             .await
             .and_then(|n| Ok(field_type_from_u8(n)?))?;
-        let size = self.read_i32().await?;
-        Ok(TListIdentifier::new(element_type, size as usize))
+        let size = signed_size(self.read_i32().await?)?;
+        let size = self.reader.collection_size(size)?;
+        Ok(TListIdentifier::new(element_type, size))
     }
 
     #[inline]
@@ -941,8 +960,9 @@ where
             .read_byte()
             .await
             .and_then(|n| Ok(field_type_from_u8(n)?))?;
-        let size = self.read_i32().await?;
-        Ok(TSetIdentifier::new(element_type, size as usize))
+        let size = signed_size(self.read_i32().await?)?;
+        let size = self.reader.collection_size(size)?;
+        Ok(TSetIdentifier::new(element_type, size))
     }
 
     #[inline]
@@ -960,8 +980,11 @@ where
             .read_byte()
             .await
             .and_then(|n| Ok(field_type_from_u8(n)?))?;
-        let size = self.read_i32().await?;
-        Ok(TMapIdentifier::new(key_type, value_type, size as usize))
+        let size = signed_size(self.read_i32().await?)?;
+        // Both keys and values consume the message's collection element budget.
+        self.reader.collection_size(size)?;
+        self.reader.collection_size(size)?;
+        Ok(TMapIdentifier::new(key_type, value_type, size))
     }
 
     #[inline]
