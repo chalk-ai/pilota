@@ -14,6 +14,7 @@ use super::{
     ProtocolException, TAsyncInputProtocol, TFieldIdentifier, TInputProtocol, TLengthProtocol,
     TListIdentifier, TMapIdentifier, TMessageIdentifier, TMessageType, TOutputProtocol,
     TSetIdentifier, TStructIdentifier, TType, ThriftException, ZERO_COPY_THRESHOLD,
+    decode_limits::{BoundedReader, DEFAULT_MAX_COLLECTION_ELEMENTS, DEFAULT_MAX_MESSAGE_BYTES},
     error::ProtocolExceptionKind,
     new_protocol_exception,
     rw_ext::{ReadExt, WriteExt},
@@ -961,7 +962,7 @@ impl TOutputProtocol for TCompactOutputProtocol<&mut LinkedBytes> {
 }
 
 pub struct TAsyncCompactProtocol<R> {
-    reader: R,
+    reader: BoundedReader<R>,
 
     last_read_field_id: i16,
     read_field_id_stack: Vec<i16>,
@@ -973,6 +974,7 @@ where
     R: AsyncRead + Unpin + Send,
 {
     async fn read_message_begin(&mut self) -> Result<TMessageIdentifier, ThriftException> {
+        self.reader.reset();
         let compact_id = self.read_byte().await?;
         if compact_id != COMPACT_PROTOCOL_ID {
             return Err(new_protocol_exception(
@@ -1093,10 +1095,7 @@ where
     #[inline]
     async fn read_bytes_vec(&mut self) -> Result<Vec<u8>, ThriftException> {
         let size = self.read_varint_async::<u32>().await? as usize;
-        // FIXME: use maybe_uninit?
-        let mut v = vec![0; size];
-        self.reader.read_exact(&mut v).await?;
-        Ok(v)
+        self.reader.read_bytes(size).await
     }
 
     #[inline]
@@ -1109,7 +1108,12 @@ where
     #[inline]
     async fn read_string(&mut self) -> Result<String, ThriftException> {
         let v = self.read_bytes_vec().await?;
-        Ok(unsafe { String::from_utf8_unchecked(v) })
+        String::from_utf8(v).map_err(|err| {
+            new_protocol_exception(
+                ProtocolExceptionKind::InvalidData,
+                format!("invalid UTF-8 string: {err}"),
+            )
+        })
     }
 
     #[inline]
@@ -1177,7 +1181,10 @@ where
 
     #[inline]
     async fn read_map_begin(&mut self) -> Result<TMapIdentifier, ThriftException> {
-        let element_count = self.read_varint_async::<u32>().await? as i32;
+        let element_count = self.read_varint_async::<u32>().await? as usize;
+        // Both keys and values consume the aggregate collection quota.
+        self.reader.collection_size(element_count)?;
+        self.reader.collection_size(element_count)?;
         if element_count == 0 {
             Ok(TMapIdentifier::new(TType::Stop, TType::Stop, 0))
         } else {
@@ -1185,11 +1192,7 @@ where
             let key_type = tcompact_get_ttype(((type_header & 0xF0) >> 4).try_into()?)?;
             let val_type = tcompact_get_ttype((type_header & 0x0F).try_into()?)?;
 
-            Ok(TMapIdentifier::new(
-                key_type,
-                val_type,
-                element_count as usize,
-            ))
+            Ok(TMapIdentifier::new(key_type, val_type, element_count))
         }
     }
 
@@ -1203,9 +1206,23 @@ impl<R> TAsyncCompactProtocol<R>
 where
     R: AsyncRead + Unpin + Send,
 {
+    /// Decode messages with a 64 MiB byte limit and 1,048,576 collection elements.
     pub fn new(reader: R) -> TAsyncCompactProtocol<R> {
-        Self {
+        Self::with_limits(
             reader,
+            DEFAULT_MAX_MESSAGE_BYTES,
+            DEFAULT_MAX_COLLECTION_ELEMENTS,
+        )
+    }
+
+    /// Set per-message wire-byte and aggregate collection-element limits.
+    pub fn with_limits(
+        reader: R,
+        max_message_bytes: usize,
+        max_collection_elements: usize,
+    ) -> TAsyncCompactProtocol<R> {
+        Self {
+            reader: BoundedReader::new(reader, max_message_bytes, max_collection_elements),
             last_read_field_id: 0,
             read_field_id_stack: Vec::new(),
             pending_read_bool_value: None,
@@ -1219,11 +1236,12 @@ where
 
         let possible_element_count = (header & 0xF0) >> 4;
         let element_count = if possible_element_count != 15 {
-            possible_element_count as i32
+            possible_element_count as usize
         } else {
-            self.read_varint_async::<u32>().await? as i32
+            self.read_varint_async::<u32>().await? as usize
         };
-        Ok((element_type, element_count as usize))
+        let element_count = self.reader.collection_size(element_count)?;
+        Ok((element_type, element_count))
     }
 
     #[inline]

@@ -2,6 +2,7 @@ pub mod binary;
 pub mod binary_le;
 pub mod binary_unsafe;
 pub mod compact;
+mod decode_limits;
 pub mod error;
 pub mod rw_ext;
 pub mod unknown;
@@ -820,7 +821,7 @@ pub trait TAsyncInputProtocol: Send {
             TType::I32 => self.read_i32().await.map(|_| ()),
             TType::I64 => self.read_i64().await.map(|_| ()),
             TType::Double => self.read_double().await.map(|_| ()),
-            TType::Binary => self.read_string().await.map(|_| ()),
+            TType::Binary => self.read_bytes().await.map(|_| ()),
             TType::Struct => {
                 self.read_struct_begin().await?;
                 loop {
